@@ -49,6 +49,7 @@ extern int do_xfrm(int argc, char **argv);
 extern int do_ipl2tp(int argc, char **argv);
 extern int do_tcp_metrics(int argc, char **argv);
 extern int do_ipnetconf(int argc, char **argv);
+extern int do_iptoken(int argc, char **argv);
 
 static inline int rtm_get_table(struct rtmsg *r, struct rtattr **tb)
 {
@@ -59,6 +60,8 @@ static inline int rtm_get_table(struct rtmsg *r, struct rtattr **tb)
 }
 
 extern struct rtnl_handle rth;
+
+#include <stdbool.h>
 
 struct link_util
 {
@@ -71,9 +74,11 @@ struct link_util
 					     struct rtattr *[]);
 	void			(*print_xstats)(struct link_util *, FILE *,
 					     struct rtattr *);
+	bool			slave;
 };
 
 struct link_util *get_link_kind(const char *kind);
+struct link_util *get_link_slave_kind(const char *slave_kind);
 int get_netns_fd(const char *name);
 
 #ifndef	INFINITY_LIFE_TIME

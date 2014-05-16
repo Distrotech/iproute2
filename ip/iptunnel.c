@@ -240,8 +240,9 @@ static int parse_args(int argc, char **argv, int cmd, struct ip_tunnel_parm *p)
 		}
 	}
 
-	if (p->iph.protocol == IPPROTO_IPIP || p->iph.protocol == IPPROTO_IPV6) {
-		if ((p->i_flags & GRE_KEY) || (p->o_flags & GRE_KEY)) {
+	if ((p->i_flags & GRE_KEY) || (p->o_flags & GRE_KEY)) {
+		if (!(p->i_flags & VTI_ISVTI) &&
+		    (p->iph.protocol != IPPROTO_GRE)) {
 			fprintf(stderr, "Keys are not allowed with ipip and sit tunnels\n");
 			return -1;
 		}
@@ -280,7 +281,7 @@ static int do_add(int cmd, int argc, char **argv)
 		return -1;
 
 	if (p.iph.ttl && p.iph.frag_off == 0) {
-		fprintf(stderr, "ttl != 0 and noptmudisc are incompatible\n");
+		fprintf(stderr, "ttl != 0 and nopmtudisc are incompatible\n");
 		return -1;
 	}
 
@@ -341,19 +342,19 @@ static void print_tunnel(struct ip_tunnel_parm *p)
 	       p->iph.daddr ? format_host(AF_INET, 4, &p->iph.daddr, s1, sizeof(s1))  : "any",
 	       p->iph.saddr ? rt_addr_n2a(AF_INET, 4, &p->iph.saddr, s2, sizeof(s2)) : "any");
 
-	if (p->i_flags & SIT_ISATAP) {
+	if (p->iph.protocol == IPPROTO_IPV6 && (p->i_flags & SIT_ISATAP)) {
 		struct ip_tunnel_prl prl[16];
 		int i;
-		
+
 		memset(prl, 0, sizeof(prl));
 		prl[0].datalen = sizeof(prl) - sizeof(prl[0]);
 		prl[0].addr = htonl(INADDR_ANY);
-	
+
 		if (!tnl_prl_ioctl(SIOCGETPRL, p->name, prl))
 			for (i = 1; i < sizeof(prl) / sizeof(prl[0]); i++)
 		{
 			if (prl[i].addr != htonl(INADDR_ANY)) {
-				printf(" %s %s ", 
+				printf(" %s %s ",
 					(prl[i].flags & PRL_DEFAULT) ? "pdr" : "pr",
 					format_host(AF_INET, 4, &prl[i].addr, s1, sizeof(s1)));
 			}

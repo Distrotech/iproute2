@@ -52,6 +52,7 @@ static const char *mx_names[RTAX_MAX+1] = {
 	[RTAX_FEATURES] = "features",
 	[RTAX_RTO_MIN]	= "rto_min",
 	[RTAX_INITRWND]	= "initrwnd",
+	[RTAX_QUICKACK]	= "quickack",
 };
 static void usage(void) __attribute__((noreturn));
 
@@ -62,7 +63,7 @@ static void usage(void)
 	fprintf(stderr, "       ip route restore\n");
 	fprintf(stderr, "       ip route showdump\n");
 	fprintf(stderr, "       ip route get ADDRESS [ from ADDRESS iif STRING ]\n");
-	fprintf(stderr, "                            [ oif STRING ]  [ tos TOS ]\n");
+	fprintf(stderr, "                            [ oif STRING ] [ tos TOS ]\n");
 	fprintf(stderr, "                            [ mark NUMBER ]\n");
 	fprintf(stderr, "       ip route { add | del | change | append | replace } ROUTE\n");
 	fprintf(stderr, "SELECTOR := [ root PREFIX ] [ match PREFIX ] [ exact PREFIX ]\n");
@@ -75,10 +76,11 @@ static void usage(void)
 	fprintf(stderr, "INFO_SPEC := NH OPTIONS FLAGS [ nexthop NH ]...\n");
 	fprintf(stderr, "NH := [ via ADDRESS ] [ dev STRING ] [ weight NUMBER ] NHFLAGS\n");
 	fprintf(stderr, "OPTIONS := FLAGS [ mtu NUMBER ] [ advmss NUMBER ]\n");
-	fprintf(stderr, "           [ rtt TIME ] [ rttvar TIME ] [reordering NUMBER ]\n");
+	fprintf(stderr, "           [ rtt TIME ] [ rttvar TIME ] [ reordering NUMBER ]\n");
 	fprintf(stderr, "           [ window NUMBER] [ cwnd NUMBER ] [ initcwnd NUMBER ]\n");
 	fprintf(stderr, "           [ ssthresh NUMBER ] [ realms REALM ] [ src ADDRESS ]\n");
 	fprintf(stderr, "           [ rto_min TIME ] [ hoplimit NUMBER ] [ initrwnd NUMBER ]\n");
+	fprintf(stderr, "           [ quickack BOOL ]\n");
 	fprintf(stderr, "TYPE := [ unicast | local | broadcast | multicast | throw |\n");
 	fprintf(stderr, "          unreachable | prohibit | blackhole | nat ]\n");
 	fprintf(stderr, "TABLE_ID := [ local | main | default | all | NUMBER ]\n");
@@ -86,6 +88,7 @@ static void usage(void)
 	fprintf(stderr, "NHFLAGS := [ onlink | pervasive ]\n");
 	fprintf(stderr, "RTPROTO := [ kernel | boot | static | NUMBER ]\n");
 	fprintf(stderr, "TIME := NUMBER[s|ms]\n");
+	fprintf(stderr, "BOOL := [1|0]\n");
 	exit(-1);
 }
 
@@ -329,7 +332,7 @@ int print_route(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
 
 	if (n->nlmsg_type == RTM_DELROUTE)
 		fprintf(fp, "Deleted ");
-	if (r->rtm_type != RTN_UNICAST && !filter.type)
+	if ((r->rtm_type != RTN_UNICAST || show_details > 0) && !filter.type)
 		fprintf(fp, "%s ", rtnl_rtntype_n2a(r->rtm_type, b1, sizeof(b1)));
 
 	if (tb[RTA_DST]) {
@@ -386,11 +389,11 @@ int print_route(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
 		fprintf(fp, "dev %s ", ll_index_to_name(*(int*)RTA_DATA(tb[RTA_OIF])));
 
 	if (!(r->rtm_flags&RTM_F_CLONED)) {
-		if (table != RT_TABLE_MAIN && !filter.tb)
+		if ((table != RT_TABLE_MAIN || show_details > 0) && !filter.tb)
 			fprintf(fp, " table %s ", rtnl_rttable_n2a(table, b1, sizeof(b1)));
-		if (r->rtm_protocol != RTPROT_BOOT && filter.protocolmask != -1)
+		if ((r->rtm_protocol != RTPROT_BOOT || show_details > 0) && filter.protocolmask != -1)
 			fprintf(fp, " proto %s ", rtnl_rtprot_n2a(r->rtm_protocol, b1, sizeof(b1)));
-		if (r->rtm_scope != RT_SCOPE_UNIVERSE && filter.scopemask != -1)
+		if ((r->rtm_scope != RT_SCOPE_UNIVERSE || show_details > 0) && filter.scopemask != -1)
 			fprintf(fp, " scope %s ", rtnl_rtscope_n2a(r->rtm_scope, b1, sizeof(b1)));
 	}
 	if (tb[RTA_PREFSRC] && filter.rprefsrc.bitlen != host_len) {
@@ -705,9 +708,9 @@ static int parse_nexthops(struct nlmsghdr *n, struct rtmsg *r,
 static int iproute_modify(int cmd, unsigned flags, int argc, char **argv)
 {
 	struct {
-		struct nlmsghdr 	n;
-		struct rtmsg 		r;
-		char   			buf[1024];
+		struct nlmsghdr	n;
+		struct rtmsg		r;
+		char  			buf[1024];
 	} req;
 	char  mxbuf[256];
 	struct rtattr * mxrta = (void*)mxbuf;
@@ -834,7 +837,7 @@ static int iproute_modify(int cmd, unsigned flags, int argc, char **argv)
 			}
 			if (get_time_rtt(&rtt, *argv, &raw))
 				invarg("\"rtt\" value is invalid\n", *argv);
-			rta_addattr32(mxrta, sizeof(mxbuf), RTAX_RTT, 
+			rta_addattr32(mxrta, sizeof(mxbuf), RTAX_RTT,
 				(raw) ? rtt : rtt * 8);
 		} else if (strcmp(*argv, "rto_min") == 0) {
 			unsigned rto_min;
@@ -885,6 +888,14 @@ static int iproute_modify(int cmd, unsigned flags, int argc, char **argv)
 			if (get_unsigned(&win, *argv, 0))
 				invarg("\"initrwnd\" value is invalid\n", *argv);
 			rta_addattr32(mxrta, sizeof(mxbuf), RTAX_INITRWND, win);
+		} else if (matches(*argv, "quickack") == 0) {
+			unsigned quickack;
+			NEXT_ARG();
+			if (get_unsigned(&quickack, *argv, 0))
+				invarg("\"quickack\" value is invalid\n", *argv);
+			if (quickack != 1 && quickack != 0)
+				invarg("\"quickack\" value should be 0 or 1\n", *argv);
+			rta_addattr32(mxrta, sizeof(mxbuf), RTAX_QUICKACK, quickack);
 		} else if (matches(*argv, "rttvar") == 0) {
 			unsigned win;
 			NEXT_ARG();
@@ -969,8 +980,6 @@ static int iproute_modify(int cmd, unsigned flags, int argc, char **argv)
 
 	if (d || nhs_ok)  {
 		int idx;
-
-		ll_init_map(&rth);
 
 		if (d) {
 			if ((idx = ll_name_to_index(d)) == 0) {
@@ -1265,8 +1274,6 @@ static int iproute_list_flush_or_save(int argc, char **argv, int action)
 	if (do_ipv6 == AF_UNSPEC && filter.tb)
 		do_ipv6 = AF_INET;
 
-	ll_init_map(&rth);
-
 	if (id || od)  {
 		int idx;
 
@@ -1334,7 +1341,7 @@ static int iproute_list_flush_or_save(int argc, char **argv, int action)
 
 			if (time(0) - start > 30) {
 				printf("\n*** Flush not completed after %ld seconds, %d entries remain ***\n",
-				       time(0) - start, filter.flushed);
+				       (long)(time(0) - start), filter.flushed);
 				exit(1);
 			}
 
@@ -1369,9 +1376,9 @@ static int iproute_list_flush_or_save(int argc, char **argv, int action)
 static int iproute_get(int argc, char **argv)
 {
 	struct {
-		struct nlmsghdr 	n;
-		struct rtmsg 		r;
-		char   			buf[1024];
+		struct nlmsghdr	n;
+		struct rtmsg		r;
+		char  			buf[1024];
 	} req;
 	char  *idev = NULL;
 	char  *odev = NULL;
@@ -1451,8 +1458,6 @@ static int iproute_get(int argc, char **argv)
 		fprintf(stderr, "need at least a destination address\n");
 		exit(1);
 	}
-
-	ll_init_map(&rth);
 
 	if (idev || odev)  {
 		int idx;

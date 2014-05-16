@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <linux/sockios.h>
+#include <stdbool.h>
 
 #include "rt_names.h"
 #include "utils.h"
@@ -47,7 +48,7 @@ void iplink_usage(void)
 		fprintf(stderr, "                   [ txqueuelen PACKETS ]\n");
 		fprintf(stderr, "                   [ address LLADDR ]\n");
 		fprintf(stderr, "                   [ broadcast LLADDR ]\n");
-		fprintf(stderr, "                   [ mtu MTU ]\n");
+		fprintf(stderr, "                   [ mtu MTU ] [index IDX ]\n");
 		fprintf(stderr, "                   [ numtxqueues QUEUE_COUNT ]\n");
 		fprintf(stderr, "                   [ numrxqueues QUEUE_COUNT ]\n");
 		fprintf(stderr, "                   type TYPE [ ARGS ]\n");
@@ -77,14 +78,16 @@ void iplink_usage(void)
 	fprintf(stderr, "				   [ rate TXRATE ] ] \n");
 
 	fprintf(stderr, "				   [ spoofchk { on | off} ] ] \n");
+	fprintf(stderr, "				   [ state { auto | enable | disable} ] ]\n");
 	fprintf(stderr, "			  [ master DEVICE ]\n");
 	fprintf(stderr, "			  [ nomaster ]\n");
-	fprintf(stderr, "       ip link show [ DEVICE | group GROUP ]\n");
+	fprintf(stderr, "       ip link show [ DEVICE | group GROUP ] [up]\n");
 
 	if (iplink_have_newlink()) {
 		fprintf(stderr, "\n");
-		fprintf(stderr, "TYPE := { vlan | veth | vcan | dummy | ifb | macvlan | can |\n");
-		fprintf(stderr, "          bridge | ipoib | ip6tnl | ipip | sit | vxlan }\n");
+		fprintf(stderr, "TYPE := { vlan | veth | vcan | dummy | ifb | macvlan | macvtap |\n");
+		fprintf(stderr, "          can | bridge | bond | ipoib | ip6tnl | ipip | sit |\n");
+		fprintf(stderr, "          vxlan | gre | gretap | ip6gre | ip6gretap | vti }\n");
 	}
 	exit(-1);
 }
@@ -103,14 +106,15 @@ static int on_off(const char *msg, const char *realval)
 static void *BODY;		/* cached dlopen(NULL) handle */
 static struct link_util *linkutil_list;
 
-struct link_util *get_link_kind(const char *id)
+static struct link_util *__get_link_kind(const char *id, bool slave)
 {
 	void *dlh;
 	char buf[256];
 	struct link_util *l;
 
 	for (l = linkutil_list; l; l = l->next)
-		if (strcmp(l->id, id) == 0)
+		if (strcmp(l->id, id) == 0 &&
+		    l->slave == slave)
 			return l;
 
 	snprintf(buf, sizeof(buf), LIBDIR "/ip/link_%s.so", id);
@@ -125,7 +129,10 @@ struct link_util *get_link_kind(const char *id)
 		}
 	}
 
-	snprintf(buf, sizeof(buf), "%s_link_util", id);
+	if (slave)
+		snprintf(buf, sizeof(buf), "%s_slave_link_util", id);
+	else
+		snprintf(buf, sizeof(buf), "%s_link_util", id);
 	l = dlsym(dlh, buf);
 	if (l == NULL)
 		return NULL;
@@ -133,6 +140,16 @@ struct link_util *get_link_kind(const char *id)
 	l->next = linkutil_list;
 	linkutil_list = l;
 	return l;
+}
+
+struct link_util *get_link_kind(const char *id)
+{
+	return __get_link_kind(id, false);
+}
+
+struct link_util *get_link_slave_kind(const char *id)
+{
+	return __get_link_kind(id, true);
 }
 
 static int get_link_mode(const char *mode)
@@ -176,7 +193,10 @@ static int iplink_have_newlink(void)
 		req.n.nlmsg_type = RTM_NEWLINK;
 		req.i.ifi_family = AF_UNSPEC;
 
-		rtnl_send(&rth, &req.n, req.n.nlmsg_len);
+		if (rtnl_send(&rth, &req.n, req.n.nlmsg_len) < 0) {
+			perror("request send failed");
+			exit(1);
+		}
 		rtnl_listen(&rth, accept_msg, NULL);
 	}
 	return have_rtnl_newlink;
@@ -242,7 +262,7 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 			}
 			ivt.vf = vf;
 			addattr_l(&req->n, sizeof(*req), IFLA_VF_TX_RATE, &ivt, sizeof(ivt));
-		
+
 		} else if (matches(*argv, "spoofchk") == 0) {
 			struct ifla_vf_spoofchk ivs;
 			NEXT_ARG();
@@ -255,6 +275,19 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 			ivs.vf = vf;
 			addattr_l(&req->n, sizeof(*req), IFLA_VF_SPOOFCHK, &ivs, sizeof(ivs));
 
+		} else if (matches(*argv, "state") == 0) {
+			struct ifla_vf_link_state ivl;
+			NEXT_ARG();
+			if (matches(*argv, "auto") == 0)
+				ivl.link_state = IFLA_VF_LINK_STATE_AUTO;
+			else if (matches(*argv, "enable") == 0)
+				ivl.link_state = IFLA_VF_LINK_STATE_ENABLE;
+			else if (matches(*argv, "disable") == 0)
+				ivl.link_state = IFLA_VF_LINK_STATE_DISABLE;
+			else
+				invarg("Invalid \"state\" value\n", *argv);
+			ivl.vf = vf;
+			addattr_l(&req->n, sizeof(*req), IFLA_VF_LINK_STATE, &ivl, sizeof(ivl));
 		} else {
 			/* rewind arg */
 			PREV_ARG();
@@ -272,9 +305,8 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 	return 0;
 }
 
-
 int iplink_parse(int argc, char **argv, struct iplink_req *req,
-		char **name, char **type, char **link, char **dev, int *group)
+		char **name, char **type, char **link, char **dev, int *group, int *index)
 {
 	int ret, len;
 	char abuf[32];
@@ -298,6 +330,9 @@ int iplink_parse(int argc, char **argv, struct iplink_req *req,
 		} else if (strcmp(*argv, "name") == 0) {
 			NEXT_ARG();
 			*name = *argv;
+		} else if (strcmp(*argv, "index") == 0) {
+			NEXT_ARG();
+			*index = atoi(*argv);
 		} else if (matches(*argv, "link") == 0) {
 			NEXT_ARG();
 			*link = *argv;
@@ -489,6 +524,7 @@ static int iplink_modify(int cmd, unsigned int flags, int argc, char **argv)
 	char *name = NULL;
 	char *link = NULL;
 	char *type = NULL;
+	int index = 0;
 	int group;
 	struct link_util *lu = NULL;
 	struct iplink_req req;
@@ -501,7 +537,7 @@ static int iplink_modify(int cmd, unsigned int flags, int argc, char **argv)
 	req.n.nlmsg_type = cmd;
 	req.i.ifi_family = preferred_family;
 
-	ret = iplink_parse(argc, argv, &req, &name, &type, &link, &dev, &group);
+	ret = iplink_parse(argc, argv, &req, &name, &type, &link, &dev, &group, &index);
 	if (ret < 0)
 		return ret;
 
@@ -533,8 +569,6 @@ static int iplink_modify(int cmd, unsigned int flags, int argc, char **argv)
 		}
 	}
 
-	ll_init_map(&rth);
-
 	if (!(flags & NLM_F_CREATE)) {
 		if (!dev) {
 			fprintf(stderr, "Not enough information: \"dev\" "
@@ -563,6 +597,8 @@ static int iplink_modify(int cmd, unsigned int flags, int argc, char **argv)
 			}
 			addattr_l(&req.n, sizeof(req), IFLA_LINK, &ifindex, 4);
 		}
+
+		req.i.ifi_index = index;
 	}
 
 	if (name) {
@@ -798,7 +834,6 @@ static int set_address(struct ifreq *ifr, int brd)
 	close(s);
 	return 0;
 }
-
 
 static int do_set(int argc, char **argv)
 {

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <netdb.h>
 #include <time.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -29,7 +30,9 @@ int filter_index;
 
 static void usage(void)
 {
-	fprintf(stderr, "Usage: bridge fdb { add | del } ADDR dev DEV {self|master} [ temp ] [ dst IPADDR]\n");
+	fprintf(stderr, "Usage: bridge fdb { add | append | del | replace } ADDR dev DEV {self|master} [ temp ]\n"
+		        "              [router] [ dst IPADDR] [ vlan VID ]\n"
+		        "              [ port PORT] [ vni VNI ] [via DEV]\n");
 	fprintf(stderr, "       bridge fdb {show} [ dev DEV ]\n");
 	exit(-1);
 }
@@ -100,11 +103,38 @@ int print_fdb(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
 
 	if (tb[NDA_DST]) {
 		SPRINT_BUF(abuf);
+		int family = AF_INET;
+
+		if (RTA_PAYLOAD(tb[NDA_DST]) == sizeof(struct in6_addr))
+			family = AF_INET6;
+
 		fprintf(fp, "dst %s ",
-			format_host(AF_INET,
+			format_host(family,
 				    RTA_PAYLOAD(tb[NDA_DST]),
 				    RTA_DATA(tb[NDA_DST]),
 				    abuf, sizeof(abuf)));
+	}
+
+	if (tb[NDA_VLAN]) {
+		__u16 vid = rta_getattr_u16(tb[NDA_VLAN]);
+		fprintf(fp, "vlan %hu ", vid);
+	}
+
+	if (tb[NDA_PORT])
+		fprintf(fp, "port %d ", ntohs(rta_getattr_u16(tb[NDA_PORT])));
+	if (tb[NDA_VNI])
+		fprintf(fp, "vni %d ", rta_getattr_u32(tb[NDA_VNI]));
+	if (tb[NDA_IFINDEX]) {
+		unsigned int ifindex = rta_getattr_u32(tb[NDA_IFINDEX]);
+
+		if (ifindex) {
+			char ifname[IF_NAMESIZE];
+
+			if (if_indextoname(ifindex, ifname))
+				fprintf(fp, "via %s ", ifname);
+			else
+				fprintf(fp, "via ifindex %u ", ifindex);
+		}
 	}
 
 	if (show_stats && tb[NDA_CACHEINFO]) {
@@ -118,6 +148,8 @@ int print_fdb(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
 		fprintf(fp, "self ");
 	if (r->ndm_flags & NTF_MASTER)
 		fprintf(fp, "master ");
+	if (r->ndm_flags & NTF_ROUTER)
+		fprintf(fp, "router ");
 
 	fprintf(fp, "%s\n", state_n2a(r->ndm_state));
 	return 0;
@@ -171,6 +203,11 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	char abuf[ETH_ALEN];
 	int dst_ok = 0;
 	inet_prefix dst;
+	unsigned long port = 0;
+	unsigned long vni = ~0;
+	unsigned int via = 0;
+	char *endptr;
+	short vid = -1;
 
 	memset(&req, 0, sizeof(req));
 
@@ -190,15 +227,46 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 				duparg2("dst", *argv);
 			get_addr(&dst, *argv, preferred_family);
 			dst_ok = 1;
+		} else if (strcmp(*argv, "port") == 0) {
+
+			NEXT_ARG();
+			port = strtoul(*argv, &endptr, 0);
+			if (endptr && *endptr) {
+				struct servent *pse;
+
+				pse = getservbyname(*argv, "udp");
+				if (!pse)
+					invarg("invalid port\n", *argv);
+				port = ntohs(pse->s_port);
+			} else if (port > 0xffff)
+				invarg("invalid port\n", *argv);
+		} else if (strcmp(*argv, "vni") == 0) {
+			NEXT_ARG();
+			vni = strtoul(*argv, &endptr, 0);
+			if ((endptr && *endptr) ||
+			    (vni >> 24) || vni == ULONG_MAX)
+				invarg("invalid VNI\n", *argv);
+		} else if (strcmp(*argv, "via") == 0) {
+			NEXT_ARG();
+			via = if_nametoindex(*argv);
+			if (via == 0)
+				invarg("invalid device\n", *argv);
 		} else if (strcmp(*argv, "self") == 0) {
 			req.ndm.ndm_flags |= NTF_SELF;
 		} else if (matches(*argv, "master") == 0) {
 			req.ndm.ndm_flags |= NTF_MASTER;
+		} else if (matches(*argv, "router") == 0) {
+			req.ndm.ndm_flags |= NTF_ROUTER;
 		} else if (matches(*argv, "local") == 0||
 			   matches(*argv, "permanent") == 0) {
 			req.ndm.ndm_state |= NUD_PERMANENT;
 		} else if (matches(*argv, "temp") == 0) {
 			req.ndm.ndm_state |= NUD_REACHABLE;
+		} else if (matches(*argv, "vlan") == 0) {
+			if (vid >= 0)
+				duparg2("vlan", *argv);
+			NEXT_ARG();
+			vid = atoi(*argv);
 		} else {
 			if (strcmp(*argv, "to") == 0) {
 				NEXT_ARG();
@@ -236,6 +304,20 @@ static int fdb_modify(int cmd, int flags, int argc, char **argv)
 	if (dst_ok)
 		addattr_l(&req.n, sizeof(req), NDA_DST, &dst.data, dst.bytelen);
 
+	if (vid >= 0)
+		addattr16(&req.n, sizeof(req), NDA_VLAN, vid);
+
+	if (port) {
+		unsigned short dport;
+
+		dport = htons((unsigned short)port);
+		addattr16(&req.n, sizeof(req), NDA_PORT, dport);
+	}
+	if (vni != ~0)
+		addattr32(&req.n, sizeof(req), NDA_VNI, vni);
+	if (via)
+		addattr32(&req.n, sizeof(req), NDA_IFINDEX, via);
+
 	req.ndm.ndm_ifindex = ll_name_to_index(d);
 	if (req.ndm.ndm_ifindex == 0) {
 		fprintf(stderr, "Cannot find device \"%s\"\n", d);
@@ -255,6 +337,10 @@ int do_fdb(int argc, char **argv)
 	if (argc > 0) {
 		if (matches(*argv, "add") == 0)
 			return fdb_modify(RTM_NEWNEIGH, NLM_F_CREATE|NLM_F_EXCL, argc-1, argv+1);
+		if (matches(*argv, "append") == 0)
+			return fdb_modify(RTM_NEWNEIGH, NLM_F_CREATE|NLM_F_APPEND, argc-1, argv+1);
+		if (matches(*argv, "replace") == 0)
+			return fdb_modify(RTM_NEWNEIGH, NLM_F_CREATE|NLM_F_REPLACE, argc-1, argv+1);
 		if (matches(*argv, "delete") == 0)
 			return fdb_modify(RTM_DELNEIGH, 0, argc-1, argv+1);
 		if (matches(*argv, "show") == 0 ||
